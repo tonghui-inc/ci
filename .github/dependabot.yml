@@ -1,0 +1,12 @@
+# 本库是公开库且持有 GitHub App 私钥，第三方 action 一律钉到 commit SHA；
+# 这里让 Dependabot 每周提 PR 把钉住的 SHA 往前推（含版本注释里的 tag）。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
