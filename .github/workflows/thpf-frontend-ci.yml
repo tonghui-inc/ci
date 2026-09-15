@@ -28,6 +28,10 @@ jobs:
     name: typecheck-test-build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # GitHub 托管 runner 为 UTC；THPF 前端用例按北京时间（CST）硬编码期望值，
+    # 不固定 TZ 会出现 8 小时差断言失败。统一覆盖 typecheck/test/build 全步。
+    env:
+      TZ: Asia/Shanghai
     if: >-
       github.event_name != 'repository_dispatch'
       || github.event.client_payload.repo == 'tonghui-inc/THPF'
