@@ -1,0 +1,310 @@
+# THPF 后端合并检查
+name: THPF Backend CI
+
+on:
+  repository_dispatch:
+    types: [thpf-backend-ci]
+  # 手动重跑（本仓库 Actions 页面）；sha 留空 = THPF 默认分支最新
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'THPF 提交 SHA（留空 = master 最新）'
+        required: false
+        default: ''
+
+concurrency:
+  group: thpf-backend-ci-${{ github.event.client_payload.pr_number || github.event.client_payload.branch || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  THPF_REPO: tonghui-inc/THPF
+  HEAD_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  JWT_SECRET_KEY: test-jwt-secret-key-for-testing-only
+  FERNET_KEY: oFu8ECAvIQNkgJ8MO8Pp8qi7jY86gxhUYhLrIQNjnMQ=
+  DEEPSEEK_API_KEY: ""
+  FILE_STORAGE_BASE: /tmp/thpf-test-files
+  AGENT_HOST_BASE_DIR: /tmp/thpf-test/users
+  USER_WORKSPACE_BASE: /tmp/thpf-test/users
+  AGENT_WORKSPACE_BASE: /tmp/thpf-test/workspace
+  AVATARS_BASE: /tmp/thpf-test/avatars
+  DATABASE_URL: postgresql+asyncpg://thpf:password@localhost:15432/thpf_test
+
+jobs:
+  unit:
+    name: pytest-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # 只接 THPF 的派发：payload.repo 由 THPF 侧 trigger 固定写入（本 workflow 不注册
+    # 任何 pull_request 事件，所以 fork 代码碰不到这里的 secret）
+    if: >-
+      github.event_name != 'repository_dispatch'
+      || github.event.client_payload.repo == 'tonghui-inc/THPF'
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Mint THPF token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.TONGHUI_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TONGHUI_BOT_PRIVATE_KEY }}
+          owner: tonghui-inc
+          repositories: THPF
+          permission-contents: read
+          permission-statuses: write
+
+      - name: Report status (pending)
+        if: env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state=pending -f context='ci/backend-unit' \
+            -f description='Backend unit tests are running' \
+            -f target_url="$RUN_URL"
+
+      - name: Checkout THPF
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.THPF_REPO }}
+          token: ${{ steps.bot.outputs.token }}
+          ref: ${{ env.HEAD_SHA || 'master' }}
+          fetch-depth: 2
+          # 关键：下面的 pytest 跑的是不可信的 PR 代码，就在同一个 workspace 里，
+          # 留着凭据它就能读到 .git/config 把 App token 偷走
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: '3.11'
+          enable-cache: true
+          # 相对 GITHUB_WORKSPACE（setup-uv 不受 defaults.run.working-directory 影响）
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Guard single alembic head
+        run: |
+          heads=$(uv run --frozen alembic heads)
+          echo "$heads"
+          if [ "$(printf '%s\n' "$heads" | grep -c '(head)')" -ne 1 ]; then
+            echo "::error::Multiple alembic heads detected — run 'uv run alembic merge <rev1> <rev2>' to converge before merge"
+            exit 1
+          fi
+
+      - name: Lint (ruff)
+        run: uv run --frozen ruff check app/ tests/
+
+      - name: Type check (ty)
+        run: uv run --frozen ty check app/ tests/
+
+      - name: OpenAPI contract snapshot
+        run: uv run --frozen python tests/platform/export_openapi_snapshot.py
+
+      - name: Unit tests
+        # -n auto：按核数并行（unit 层无共享状态）
+        run: uv run --frozen python -m pytest tests/ -m "not integration" -n auto --cov=app --cov-report=xml:coverage-unit.xml --tb=short
+
+      - name: Check Codecov token
+        id: codecov
+        if: always()
+        working-directory: .
+        env:
+          TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          # 不能在 if: 里直接读 secrets，先用输出中转
+          if [ -n "$TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::tonghui-inc/ci 未配置 CODECOV_TOKEN，本次跳过覆盖率上传（不影响测试结论）"
+          fi
+
+      - name: Upload coverage reports to Codecov
+        if: always() && steps.codecov.outputs.present == '1'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          files: backend/coverage-unit.xml
+          flags: backend-unit
+          name: backend-unit
+          fail_ci_if_error: false
+
+      - name: Report status (final)
+        # cancelled 不回写：取消是"被同一 PR 的新一轮取代"，那一轮会自己写
+        # pending → final。回写 error 反而会和新一轮的 final 抢时序，留下假红灯
+        if: always() && env.HEAD_SHA != '' && job.status != 'cancelled'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; desc='Backend unit tests passed' ;;
+            *)       state=failure; desc='Backend unit tests failed' ;;
+          esac
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context='ci/backend-unit' \
+            -f description="$desc" -f target_url="$RUN_URL"
+
+  integration:
+    name: pytest-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name != 'repository_dispatch'
+      || github.event.client_payload.repo == 'tonghui-inc/THPF'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg14
+        env:
+          POSTGRES_USER: thpf
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: thpf_test
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U thpf -d thpf_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Mint THPF token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.TONGHUI_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TONGHUI_BOT_PRIVATE_KEY }}
+          owner: tonghui-inc
+          repositories: THPF
+          permission-contents: read
+          permission-statuses: write
+
+      - name: Report status (pending)
+        if: env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state=pending -f context='ci/backend-integration' \
+            -f description='Backend integration tests are running' \
+            -f target_url="$RUN_URL"
+
+      - name: Checkout THPF
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.THPF_REPO }}
+          token: ${{ steps.bot.outputs.token }}
+          ref: ${{ env.HEAD_SHA || 'master' }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: '3.11'
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Enable Postgres extensions
+        run: |
+          uv run --frozen python - <<'PY'
+          import asyncio, os, asyncpg
+          async def main():
+              dsn = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+              conn = await asyncpg.connect(dsn)
+              await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+              await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+              await conn.close()
+          asyncio.run(main())
+          PY
+
+      - name: Detect archive scope
+        working-directory: .
+        env:
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          TRIGGER_EVENT: ${{ github.event.client_payload.event_name }}
+        run: |
+          if [ "$TRIGGER_EVENT" != "pull_request" ]; then
+            echo "run_archive=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          if [ -z "$BASE_SHA" ] || ! git fetch --depth=1 origin "$BASE_SHA"; then
+            echo "run_archive=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" HEAD | grep -qE '^backend/(app/modules/(flow|kb)/|tests/test_)'; then
+            echo "run_archive=1" >> "$GITHUB_ENV"
+          else
+            echo "run_archive=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Integration tests（合并检查层）
+        run: uv run --frozen python -m pytest tests/core tests/platform tests/services -m "integration and not docker" -n auto --cov=app --cov-report=xml:coverage-integration.xml --tb=short
+
+      - name: Integration tests（验收存档层）
+        if: env.run_archive == '1'
+        run: uv run --frozen python -m pytest tests/test_*.py -m "integration and not docker" -n auto --cov=app --cov-report=xml:coverage-archive.xml --tb=short
+
+      - name: Test summary
+        if: always()
+        working-directory: .
+        run: |
+          echo "## Backend integration 结果" >> $GITHUB_STEP_SUMMARY
+          echo "- 合并检查层：必须通过，失败阻止合并" >> $GITHUB_STEP_SUMMARY
+          echo "- 验收存档层（run_archive=${{ env.run_archive }}）：按变更范围加跑" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check Codecov token
+        id: codecov
+        if: always()
+        working-directory: .
+        env:
+          TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::tonghui-inc/ci 未配置 CODECOV_TOKEN，本次跳过覆盖率上传（不影响测试结论）"
+          fi
+
+      - name: Upload coverage reports to Codecov
+        if: always() && steps.codecov.outputs.present == '1'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          files: backend/coverage-integration*.xml
+          flags: backend
+          name: backend-integration
+          fail_ci_if_error: false
+
+      - name: Report status (final)
+        # cancelled 不回写，理由同 unit job
+        if: always() && env.HEAD_SHA != '' && job.status != 'cancelled'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; desc='Backend integration tests passed' ;;
+            *)       state=failure; desc='Backend integration tests failed' ;;
+          esac
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context='ci/backend-integration' \
+            -f description="$desc" -f target_url="$RUN_URL"

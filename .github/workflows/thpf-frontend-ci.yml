@@ -1,0 +1,112 @@
+# THPF 前端合并检查
+name: THPF Frontend CI
+
+on:
+  repository_dispatch:
+    types: [thpf-frontend-ci]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'THPF 提交 SHA（留空 = master 最新）'
+        required: false
+        default: ''
+
+concurrency:
+  group: thpf-frontend-ci-${{ github.event.client_payload.pr_number || github.event.client_payload.branch || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  THPF_REPO: tonghui-inc/THPF
+  HEAD_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  frontend:
+    name: typecheck-test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      github.event_name != 'repository_dispatch'
+      || github.event.client_payload.repo == 'tonghui-inc/THPF'
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Mint THPF token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.TONGHUI_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TONGHUI_BOT_PRIVATE_KEY }}
+          owner: tonghui-inc
+          repositories: THPF
+          permission-contents: read
+          permission-statuses: write
+
+      - name: Report status (pending)
+        if: env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state=pending -f context='ci/frontend' \
+            -f description='Frontend typecheck/test/build are running' \
+            -f target_url="$RUN_URL"
+
+      - name: Checkout THPF
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.THPF_REPO }}
+          token: ${{ steps.bot.outputs.token }}
+          ref: ${{ env.HEAD_SHA || 'master' }}
+          fetch-depth: 0
+          # 关键：lint/test 会执行仓库内的脚本与依赖代码，别把 App token 留在 .git/config
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: API types consistency
+        run: npx openapi-typescript ../backend/tests/platform/openapi-snapshot.json -o /tmp/schema-check.d.ts && diff -q /tmp/schema-check.d.ts src/api/schema.d.ts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npx vite build
+        env:
+          VITE_BASE: /thpf/
+
+      - name: Report status (final)
+        # cancelled 不回写：取消是"被同一 PR 的新一轮取代"，那一轮会自己写
+        # pending → final，回写 error 只会留下假红灯
+        if: always() && env.HEAD_SHA != '' && job.status != 'cancelled'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; desc='Frontend typecheck/test/build passed' ;;
+            *)       state=failure; desc='Frontend typecheck/test/build failed' ;;
+          esac
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context='ci/frontend' \
+            -f description="$desc" -f target_url="$RUN_URL"
