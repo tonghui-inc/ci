@@ -109,6 +109,13 @@ jobs:
       - name: OpenAPI contract snapshot
         run: uv run --frozen python tests/platform/export_openapi_snapshot.py
 
+      - name: Install CJK fonts (reportlab needs TrueType outline)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-wqy-zenhei fonts-noto-cjk
+          fc-cache -f >/dev/null
+          fc-list :lang=zh file | head -5
+
       - name: Unit tests
         # -n auto：按核数并行（unit 层无共享状态）
         run: uv run --frozen python -m pytest tests/ -m "not integration" -n auto --cov=app --cov-report=xml:coverage-unit.xml --tb=short
@@ -252,6 +259,13 @@ jobs:
           else
             echo "run_archive=0" >> "$GITHUB_ENV"
           fi
+
+      - name: Install CJK fonts (reportlab needs TrueType outline)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-wqy-zenhei fonts-noto-cjk
+          fc-cache -f >/dev/null
+          fc-list :lang=zh file | head -5
 
       - name: Integration tests（合并检查层）
         run: uv run --frozen python -m pytest tests/core tests/platform tests/services -m "integration and not docker" -n auto --cov=app --cov-report=xml:coverage-integration.xml --tb=short
