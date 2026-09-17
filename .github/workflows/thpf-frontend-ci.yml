@@ -1,0 +1,224 @@
+name: THPF Frontend CI
+
+on:
+  repository_dispatch:
+    types: [thpf-frontend-ci]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'THPF 提交 SHA（留空 = master 最新）'
+        required: false
+        default: ''
+      pr_number:
+        description: 'THPF PR 编号（可选；用于把失败信息评论到该 PR）'
+        required: false
+        default: ''
+
+concurrency:
+  group: thpf-frontend-ci-${{ github.event.client_payload.pr_number || github.event.client_payload.branch || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  THPF_REPO: tonghui-inc/THPF
+  HEAD_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  CI_LOG: /tmp/thpf-ci-error.log
+
+jobs:
+  frontend:
+    name: typecheck-test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+    if: >-
+      github.event_name != 'repository_dispatch'
+      || github.event.client_payload.repo == 'tonghui-inc/THPF'
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+        working-directory: frontend
+    steps:
+      - name: Mint THPF token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.TONGHUI_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TONGHUI_BOT_PRIVATE_KEY }}
+          owner: tonghui-inc
+          repositories: THPF
+          permission-contents: read
+          permission-statuses: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Report status (pending)
+        if: env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state=pending -f context='ci/frontend' \
+            -f description='Frontend typecheck/test/build are running' \
+            -f target_url="$RUN_URL"
+
+      - name: Checkout THPF
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.THPF_REPO }}
+          token: ${{ steps.bot.outputs.token }}
+          ref: ${{ env.HEAD_SHA || 'master' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci 2>&1 | tee -a "$CI_LOG"
+
+      - name: API types consistency
+        run: |
+          { npx openapi-typescript ../backend/tests/platform/openapi-snapshot.json -o /tmp/schema-check.d.ts && diff -q /tmp/schema-check.d.ts src/api/schema.d.ts; } 2>&1 | tee -a "$CI_LOG"
+
+      - name: Lint
+        run: npm run lint 2>&1 | tee -a "$CI_LOG"
+
+      - name: Typecheck
+        run: npm run typecheck 2>&1 | tee -a "$CI_LOG"
+
+      - name: Test
+        run: npm run test -- --coverage --coverage.provider=v8 --coverage.reporter=lcov --coverage.reportsDirectory=coverage --reporter=default --reporter=github-actions --reporter=junit --outputFile.junit=junit.xml 2>&1 | tee -a "$CI_LOG"
+
+      - name: Build
+        run: npx vite build 2>&1 | tee -a "$CI_LOG"
+        env:
+          VITE_BASE: /thpf/
+
+      - name: Check Codecov token
+        id: codecov
+        if: always()
+        working-directory: .
+        env:
+          TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::tonghui-inc/ci 未配置 CODECOV_TOKEN，本次跳过覆盖率与测试结果上传（不影响测试结论）"
+          fi
+
+      - name: Upload coverage reports to Codecov
+        if: always() && steps.codecov.outputs.present == '1'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          files: frontend/coverage/lcov.info
+          flags: frontend
+          name: frontend
+          fail_ci_if_error: false
+
+      - name: Upload test results to Codecov
+        if: always() && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          report_type: test_results
+          files: frontend/junit.xml
+          fail_ci_if_error: false
+
+      - name: Checkout ci tooling
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: tonghui-inc/ci
+          ref: main
+          path: .ci-tools
+          persist-credentials: false
+
+      - name: Comment CI report to PR
+        if: always()
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          COVERAGE_PROJECT_TARGET: ${{ vars.COVERAGE_PROJECT_TARGET }}
+          COVERAGE_PATCH_TARGET: ${{ vars.COVERAGE_PATCH_TARGET }}
+          COVERAGE_REPORT: frontend/coverage/lcov.info
+          COVERAGE_SRC_ROOT: frontend
+          REPORT_TITLE: frontend
+          REPORT_MARKER: ci-report:frontend
+          JUNIT_REPORTS: frontend/junit.xml
+        run: python3 .ci-tools/.github/scripts/ci_report.py
+
+      - name: Report status (final)
+        if: always() && env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; desc='Frontend typecheck/test/build passed' ;;
+            cancelled) state=error; desc='Frontend typecheck/test/build cancelled' ;;
+            *)       state=failure; desc='Frontend typecheck/test/build failed' ;;
+          esac
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context='ci/frontend' \
+            -f description="$desc" -f target_url="$RUN_URL"
+
+      - name: Comment error to PR
+        if: failure()
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_LABEL: Frontend typecheck/test/build
+          MARKER: ci-error:frontend
+        run: |
+          PR="$PR_NUMBER"
+          if [ -z "$PR" ] && [ -n "$HEAD_SHA" ]; then
+            RAW_PR=$(gh api "repos/$THPF_REPO/commits/$HEAD_SHA/pulls" \
+              --jq '[.[] | select(.state == "open")][0].number // empty' 2>/dev/null || true)
+            case "$RAW_PR" in
+              '') : ;;
+              *[!0-9]*) echo "::warning::Failed to resolve an open PR for $HEAD_SHA; skipping error comment" ;;
+              *) PR="$RAW_PR" ;;
+            esac
+          fi
+          case "$PR" in
+            ''|*[!0-9]*) PR="" ;;
+          esac
+          if [ -z "$PR" ]; then
+            echo "No open PR for this trigger; skipping error comment"
+            exit 0
+          fi
+          BODY_FILE=$(mktemp)
+          {
+            printf '**%s failed** — [run logs](%s)\n\n~~~\n' "$JOB_LABEL" "$RUN_URL"
+            if [ -s "$CI_LOG" ]; then
+              sed 's/\x1b\[[0-9;]*m//g' "$CI_LOG" | tail -n 20
+            else
+              echo '(no output captured; check the run logs)'
+            fi
+            printf '~~~\n<!-- %s -->\n' "$MARKER"
+          } > "$BODY_FILE"
+          COMMENT_ID=$(gh api "repos/$THPF_REPO/issues/$PR/comments" --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | sed -n '1p')
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/$THPF_REPO/issues/comments/$COMMENT_ID" -F body=@"$BODY_FILE"
+          else
+            gh api -X POST "repos/$THPF_REPO/issues/$PR/comments" -F body=@"$BODY_FILE"
+          fi

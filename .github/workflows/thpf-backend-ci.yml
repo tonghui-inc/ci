@@ -1,0 +1,487 @@
+name: THPF Backend CI
+
+on:
+  repository_dispatch:
+    types: [thpf-backend-ci]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'THPF 提交 SHA（留空 = master 最新）'
+        required: false
+        default: ''
+      pr_number:
+        description: 'THPF PR 编号（可选；用于把失败信息评论到该 PR）'
+        required: false
+        default: ''
+
+concurrency:
+  group: thpf-backend-ci-${{ github.event.client_payload.pr_number || github.event.client_payload.branch || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  THPF_REPO: tonghui-inc/THPF
+  HEAD_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  PR_NUMBER: ${{ github.event.client_payload.pr_number || inputs.pr_number }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  JWT_SECRET_KEY: test-jwt-secret-key-for-testing-only
+  FERNET_KEY: oFu8ECAvIQNkgJ8MO8Pp8qi7jY86gxhUYhLrIQNjnMQ=
+  DEEPSEEK_API_KEY: ""
+  FILE_STORAGE_BASE: /tmp/thpf-test-files
+  AGENT_HOST_BASE_DIR: /tmp/thpf-test/users
+  USER_WORKSPACE_BASE: /tmp/thpf-test/users
+  AGENT_WORKSPACE_BASE: /tmp/thpf-test/workspace
+  AVATARS_BASE: /tmp/thpf-test/avatars
+  DATABASE_URL: postgresql+asyncpg://thpf:password@localhost:15432/thpf_test
+  CI_LOG: /tmp/thpf-ci-error.log
+
+jobs:
+  unit:
+    name: pytest-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      github.event_name != 'repository_dispatch'
+      || github.event.client_payload.repo == 'tonghui-inc/THPF'
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+        working-directory: backend
+    steps:
+      - name: Mint THPF token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.TONGHUI_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TONGHUI_BOT_PRIVATE_KEY }}
+          owner: tonghui-inc
+          repositories: THPF
+          permission-contents: read
+          permission-statuses: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Report status (pending)
+        if: env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state=pending -f context='ci/backend-unit' \
+            -f description='Backend unit tests are running' \
+            -f target_url="$RUN_URL"
+
+      - name: Checkout THPF
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.THPF_REPO }}
+          token: ${{ steps.bot.outputs.token }}
+          ref: ${{ env.HEAD_SHA || 'master' }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          python-version: '3.14'
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen 2>&1 | tee -a "$CI_LOG"
+
+      - name: Guard single alembic head
+        run: |
+          {
+          heads=$(uv run --frozen alembic heads)
+          echo "$heads"
+          if [ "$(printf '%s\n' "$heads" | grep -c '(head)')" -ne 1 ]; then
+            echo "::error::Multiple alembic heads detected — run 'uv run alembic merge <rev1> <rev2>' to converge before merge"
+            exit 1
+          fi
+          } 2>&1 | tee -a "$CI_LOG"
+
+      - name: Lint (ruff)
+        run: uv run --frozen ruff check app/ tests/ 2>&1 | tee -a "$CI_LOG"
+
+      - name: Type check (ty)
+        run: uv run --frozen ty check app/ tests/ 2>&1 | tee -a "$CI_LOG"
+
+      - name: OpenAPI contract snapshot
+        run: uv run --frozen python tests/platform/export_openapi_snapshot.py 2>&1 | tee -a "$CI_LOG"
+
+      - name: Unit tests
+        run: uv run --frozen python -m pytest tests/ -m "not integration" -n auto --cov=app --cov-report=xml:coverage-unit.xml --junitxml=junit-unit.xml -o junit_family=legacy --tb=short 2>&1 | tee -a "$CI_LOG"
+
+      - name: Check Codecov token
+        id: codecov
+        if: always()
+        working-directory: .
+        env:
+          TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::tonghui-inc/ci 未配置 CODECOV_TOKEN，本次跳过覆盖率与测试结果上传（不影响测试结论）"
+          fi
+
+      - name: Upload coverage reports to Codecov
+        if: always() && steps.codecov.outputs.present == '1'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          files: backend/coverage-unit.xml
+          flags: backend-unit
+          name: backend-unit
+          fail_ci_if_error: false
+
+      - name: Upload test results to Codecov
+        if: always() && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          report_type: test_results
+          files: backend/junit-unit.xml
+          fail_ci_if_error: false
+
+      - name: Checkout ci tooling
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: tonghui-inc/ci
+          ref: main
+          path: .ci-tools
+          persist-credentials: false
+
+      - name: Comment CI report to PR
+        if: always()
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          COVERAGE_PROJECT_TARGET: ${{ vars.COVERAGE_PROJECT_TARGET }}
+          COVERAGE_PATCH_TARGET: ${{ vars.COVERAGE_PATCH_TARGET }}
+          COVERAGE_REPORT: backend/coverage-unit.xml
+          COVERAGE_SRC_ROOT: backend
+          REPORT_TITLE: backend-unit
+          REPORT_MARKER: ci-report:backend-unit
+          JUNIT_REPORTS: backend/junit-unit.xml
+        run: python3 .ci-tools/.github/scripts/ci_report.py
+
+      - name: Report status (final)
+        if: always() && env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; desc='Backend unit tests passed' ;;
+            cancelled) state=error; desc='Backend unit tests cancelled' ;;
+            *)       state=failure; desc='Backend unit tests failed' ;;
+          esac
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context='ci/backend-unit' \
+            -f description="$desc" -f target_url="$RUN_URL"
+
+      - name: Comment error to PR
+        if: failure()
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_LABEL: Backend unit tests
+          MARKER: ci-error:backend-unit
+        run: |
+          PR="$PR_NUMBER"
+          if [ -z "$PR" ] && [ -n "$HEAD_SHA" ]; then
+            RAW_PR=$(gh api "repos/$THPF_REPO/commits/$HEAD_SHA/pulls" \
+              --jq '[.[] | select(.state == "open")][0].number // empty' 2>/dev/null || true)
+            case "$RAW_PR" in
+              '') : ;;
+              *[!0-9]*) echo "::warning::Failed to resolve an open PR for $HEAD_SHA; skipping error comment" ;;
+              *) PR="$RAW_PR" ;;
+            esac
+          fi
+          case "$PR" in
+            ''|*[!0-9]*) PR="" ;;
+          esac
+          if [ -z "$PR" ]; then
+            echo "No open PR for this trigger; skipping error comment"
+            exit 0
+          fi
+          BODY_FILE=$(mktemp)
+          {
+            printf '**%s failed** — [run logs](%s)\n\n~~~\n' "$JOB_LABEL" "$RUN_URL"
+            if [ -s "$CI_LOG" ]; then
+              sed 's/\x1b\[[0-9;]*m//g' "$CI_LOG" | tail -n 20
+            else
+              echo '(no output captured; check the run logs)'
+            fi
+            printf '~~~\n<!-- %s -->\n' "$MARKER"
+          } > "$BODY_FILE"
+          COMMENT_ID=$(gh api "repos/$THPF_REPO/issues/$PR/comments" --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | sed -n '1p')
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/$THPF_REPO/issues/comments/$COMMENT_ID" -F body=@"$BODY_FILE"
+          else
+            gh api -X POST "repos/$THPF_REPO/issues/$PR/comments" -F body=@"$BODY_FILE"
+          fi
+
+  integration:
+    name: pytest-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name != 'repository_dispatch'
+      || github.event.client_payload.repo == 'tonghui-inc/THPF'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg14
+        env:
+          POSTGRES_USER: thpf
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: thpf_test
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U thpf -d thpf_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+        working-directory: backend
+    steps:
+      - name: Mint THPF token
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.TONGHUI_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.TONGHUI_BOT_PRIVATE_KEY }}
+          owner: tonghui-inc
+          repositories: THPF
+          permission-contents: read
+          permission-statuses: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Report status (pending)
+        if: env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state=pending -f context='ci/backend-integration' \
+            -f description='Backend integration tests are running' \
+            -f target_url="$RUN_URL"
+
+      - name: Checkout THPF
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.THPF_REPO }}
+          token: ${{ steps.bot.outputs.token }}
+          ref: ${{ env.HEAD_SHA || 'master' }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          python-version: '3.14'
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen 2>&1 | tee -a "$CI_LOG"
+
+      - name: Enable Postgres extensions
+        run: |
+          {
+          uv run --frozen python - <<'PY'
+          import asyncio, os, asyncpg
+          async def main():
+              dsn = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+              conn = await asyncpg.connect(dsn)
+              await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+              await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+              await conn.close()
+          asyncio.run(main())
+          PY
+          } 2>&1 | tee -a "$CI_LOG"
+
+      - name: Detect archive scope
+        working-directory: .
+        env:
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          TRIGGER_EVENT: ${{ github.event.client_payload.event_name }}
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+        run: |
+          if [ "$TRIGGER_EVENT" != "pull_request" ]; then
+            echo "run_archive=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            echo "run_archive=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          if ! git -c http.extraheader="$AUTH" fetch --depth=1 origin "$BASE_SHA"; then
+            echo "run_archive=1" >> "$GITHUB_ENV"; exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" HEAD | grep -E '^backend/(app/modules/(flow|kb)/|tests/test_)' > /dev/null; then
+            echo "run_archive=1" >> "$GITHUB_ENV"
+          else
+            echo "run_archive=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Integration tests（合并检查层）
+        run: uv run --frozen python -m pytest tests/core tests/platform tests/services -m "integration and not docker" -n auto --cov=app --cov-report=xml:coverage-integration.xml --junitxml=junit-integration.xml -o junit_family=legacy --tb=short 2>&1 | tee -a "$CI_LOG"
+
+      - name: Integration tests（验收存档层）
+        if: env.run_archive == '1'
+        run: uv run --frozen python -m pytest tests/test_*.py -m "integration and not docker" -n auto --cov=app --cov-report=xml:coverage-archive.xml --junitxml=junit-archive.xml -o junit_family=legacy --tb=short 2>&1 | tee -a "$CI_LOG"
+
+      - name: Test summary
+        if: always()
+        working-directory: .
+        run: |
+          echo "## Backend integration 结果" >> $GITHUB_STEP_SUMMARY
+          echo "- 合并检查层：必须通过，失败阻止合并" >> $GITHUB_STEP_SUMMARY
+          echo "- 验收存档层（run_archive=${{ env.run_archive }}）：按变更范围加跑" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check Codecov token
+        id: codecov
+        if: always()
+        working-directory: .
+        env:
+          TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::tonghui-inc/ci 未配置 CODECOV_TOKEN，本次跳过覆盖率与测试结果上传（不影响测试结论）"
+          fi
+
+      - name: Upload coverage reports to Codecov
+        if: always() && steps.codecov.outputs.present == '1'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          files: backend/coverage-integration*.xml
+          flags: backend
+          name: backend-integration
+          fail_ci_if_error: false
+
+      - name: Upload test results to Codecov
+        if: always() && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          report_type: test_results
+          files: backend/junit-integration.xml
+          fail_ci_if_error: false
+
+      - name: Upload archive test results to Codecov
+        if: always() && env.run_archive == '1' && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
+        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tonghui-inc/THPF
+          report_type: test_results
+          files: backend/junit-archive.xml
+          fail_ci_if_error: false
+
+      - name: Checkout ci tooling
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: tonghui-inc/ci
+          ref: main
+          path: .ci-tools
+          persist-credentials: false
+
+      - name: Comment CI report to PR
+        if: always()
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          COVERAGE_PROJECT_TARGET: ${{ vars.COVERAGE_PROJECT_TARGET }}
+          COVERAGE_PATCH_TARGET: ${{ vars.COVERAGE_PATCH_TARGET }}
+          COVERAGE_REPORT: backend/coverage-integration.xml
+          COVERAGE_SRC_ROOT: backend
+          REPORT_TITLE: backend-integration
+          REPORT_MARKER: ci-report:backend-integration
+          JUNIT_REPORTS: backend/junit-integration.xml backend/junit-archive.xml
+        run: python3 .ci-tools/.github/scripts/ci_report.py
+
+      - name: Report status (final)
+        if: always() && env.HEAD_SHA != ''
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in
+            success) state=success; desc='Backend integration tests passed' ;;
+            cancelled) state=error; desc='Backend integration tests cancelled' ;;
+            *)       state=failure; desc='Backend integration tests failed' ;;
+          esac
+          gh api -X POST "repos/$THPF_REPO/statuses/$HEAD_SHA" \
+            -f state="$state" -f context='ci/backend-integration' \
+            -f description="$desc" -f target_url="$RUN_URL"
+
+      - name: Comment error to PR
+        if: failure()
+        continue-on-error: true
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          JOB_LABEL: Backend integration tests
+          MARKER: ci-error:backend-integration
+        run: |
+          PR="$PR_NUMBER"
+          if [ -z "$PR" ] && [ -n "$HEAD_SHA" ]; then
+            RAW_PR=$(gh api "repos/$THPF_REPO/commits/$HEAD_SHA/pulls" \
+              --jq '[.[] | select(.state == "open")][0].number // empty' 2>/dev/null || true)
+            case "$RAW_PR" in
+              '') : ;;
+              *[!0-9]*) echo "::warning::Failed to resolve an open PR for $HEAD_SHA; skipping error comment" ;;
+              *) PR="$RAW_PR" ;;
+            esac
+          fi
+          case "$PR" in
+            ''|*[!0-9]*) PR="" ;;
+          esac
+          if [ -z "$PR" ]; then
+            echo "No open PR for this trigger; skipping error comment"
+            exit 0
+          fi
+          BODY_FILE=$(mktemp)
+          {
+            printf '**%s failed** — [run logs](%s)\n\n~~~\n' "$JOB_LABEL" "$RUN_URL"
+            if [ -s "$CI_LOG" ]; then
+              sed 's/\x1b\[[0-9;]*m//g' "$CI_LOG" | tail -n 20
+            else
+              echo '(no output captured; check the run logs)'
+            fi
+            printf '~~~\n<!-- %s -->\n' "$MARKER"
+          } > "$BODY_FILE"
+          COMMENT_ID=$(gh api "repos/$THPF_REPO/issues/$PR/comments" --paginate --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | sed -n '1p')
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/$THPF_REPO/issues/comments/$COMMENT_ID" -F body=@"$BODY_FILE"
+          else
+            gh api -X POST "repos/$THPF_REPO/issues/$PR/comments" -F body=@"$BODY_FILE"
+          fi
