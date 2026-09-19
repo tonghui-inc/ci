@@ -90,6 +90,15 @@ jobs:
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
 
+      - name: Install CJK font (PDF 生成依赖，与 backend/Dockerfile 对齐)
+        # R0070-刀2：file_generate 用 reportlab TTFont 生成中文 PDF，只支持 TrueType 轮廓；
+        # 产品镜像装 fonts-wqy-zenhei（backend/Dockerfile:43-55），CI runner 不在该镜像里跑，
+        # 少了它 test_r200_form_render_smoke 的 PDF 用例必红。Noto CJK 是 CFF 轮廓，不可替代。
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-wqy-zenhei
+          fc-list :lang=zh | wc -l
+
       - name: Install dependencies
         run: uv sync --frozen 2>&1 | tee -a "$CI_LOG"
 
@@ -300,6 +309,15 @@ jobs:
           python-version: '3.14'
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
+
+      - name: Install CJK font (PDF 生成依赖，与 backend/Dockerfile 对齐)
+        # R0070-刀2：file_generate 用 reportlab TTFont 生成中文 PDF，只支持 TrueType 轮廓；
+        # 产品镜像装 fonts-wqy-zenhei（backend/Dockerfile:43-55），CI runner 不在该镜像里跑，
+        # 少了它 test_r200_form_render_smoke 的 PDF 用例必红。Noto CJK 是 CFF 轮廓，不可替代。
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-wqy-zenhei
+          fc-list :lang=zh | wc -l
 
       - name: Install dependencies
         run: uv sync --frozen 2>&1 | tee -a "$CI_LOG"
