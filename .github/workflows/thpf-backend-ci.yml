@@ -141,7 +141,7 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         if: always() && steps.codecov.outputs.present == '1'
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: tonghui-inc/THPF
@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload test results to Codecov
         if: always() && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: tonghui-inc/THPF
@@ -391,7 +391,7 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         if: always() && steps.codecov.outputs.present == '1'
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: tonghui-inc/THPF
@@ -402,7 +402,7 @@ jobs:
 
       - name: Upload test results to Codecov
         if: always() && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: tonghui-inc/THPF
@@ -412,7 +412,7 @@ jobs:
 
       - name: Upload archive test results to Codecov
         if: always() && env.run_archive == '1' && steps.codecov.outputs.present == '1' && vars.CODECOV_TEST_RESULTS == 'true'
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: tonghui-inc/THPF
